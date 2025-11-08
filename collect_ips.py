@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+import random
 
 # 目标URL列表
 urls = [
@@ -51,10 +52,8 @@ if unique_ips:
     # 创建结果字符串
     result = []
     
-    # 从网页内容中提取运营商信息
-    mobile_ip = None
-    union_ip = None
-    telecom_ip = None
+    # 存储IP和运营商的对应关系
+    ip_carrier_map = {}
     
     # 重新请求网页获取完整内容，包括运营商信息
     try:
@@ -77,48 +76,29 @@ if unique_ips:
                     ip_match = re.search(ip_pattern, ip_cell)
                     if ip_match:
                         ip = ip_match.group(0)
-                        
-                        # 根据运营商名称分类
-                        if '移动' in carrier and not mobile_ip:
-                            mobile_ip = ip
-                        elif '联通' in carrier and not union_ip:
-                            union_ip = ip
-                        elif '电信' in carrier and not telecom_ip:
-                            telecom_ip = ip
-            
-            # 如果没有找到特定运营商的IP，使用前三个IP作为备选
-            if not mobile_ip and len(sorted_ips) > 0:
-                mobile_ip = sorted_ips[0]
-            
-            if not union_ip and len(sorted_ips) > 1:
-                union_ip = sorted_ips[1]
-            
-            if not telecom_ip and len(sorted_ips) > 2:
-                telecom_ip = sorted_ips[2]
-                
+                        # 存储IP和运营商的对应关系
+                        if '移动' in carrier:
+                            ip_carrier_map[ip] = '移动'
+                        elif '联通' in carrier:
+                            ip_carrier_map[ip] = '联通'
+                        elif '电信' in carrier:
+                            ip_carrier_map[ip] = '电信'
+                        else:
+                            ip_carrier_map[ip] = '未知'
+                            
     except Exception as e:
         print(f'解析运营商信息失败: {e}')
-        
-        # 如果解析失败，使用前三个IP作为备选
-        if len(sorted_ips) > 0:
-            mobile_ip = sorted_ips[0]
-        if len(sorted_ips) > 1:
-            union_ip = sorted_ips[1]
-        if len(sorted_ips) > 2:
-            telecom_ip = sorted_ips[2]
+        # 如果解析失败，给所有IP分配未知运营商
+        for ip in sorted_ips:
+            ip_carrier_map[ip] = '未知'
     
-    # 为找到的IP添加端口信息
-    if mobile_ip:
-        for port in tsl_ports:
-            result.append(f"{mobile_ip}:{port}#移动")
-    
-    if union_ip:
-        for port in tsl_ports:
-            result.append(f"{union_ip}:{port}#联通")
-    
-    if telecom_ip:
-        for port in tsl_ports:
-            result.append(f"{telecom_ip}:{port}#电信")
+    # 为每个IP地址随机选择一个端口，并添加运营商信息
+    for ip in sorted_ips:
+        # 从tsl_ports中随机选择一个端口
+        random_port = random.choice(tsl_ports)
+        # 获取运营商信息，如果没有则使用未知
+        carrier = ip_carrier_map.get(ip, '未知')
+        result.append(f"{ip}:{random_port}#{carrier}")
     
     # 写入文件
     with open('ip.txt', 'w', encoding='utf-8') as file:
@@ -128,18 +108,13 @@ if unique_ips:
     # 创建notslip.txt文件内容
     notslip_result = []
     
-    # 为每个IP添加notsl_ports中的所有端口，并带上运营商信息
-    if mobile_ip:
-        for port in notsl_ports:
-            notslip_result.append(f"{mobile_ip}:{port}#移动")
-    
-    if union_ip:
-        for port in notsl_ports:
-            notslip_result.append(f"{union_ip}:{port}#联通")
-    
-    if telecom_ip:
-        for port in notsl_ports:
-            notslip_result.append(f"{telecom_ip}:{port}#电信")
+    # 为每个IP地址随机选择一个notsl端口，并添加运营商信息
+    for ip in sorted_ips:
+        # 从notsl_ports中随机选择一个端口
+        random_port = random.choice(notsl_ports)
+        # 获取运营商信息，如果没有则使用未知
+        carrier = ip_carrier_map.get(ip, '未知')
+        notslip_result.append(f"{ip}:{random_port}#{carrier}")
     
     # 检查notslip.txt文件是否存在，如果存在则删除它
     if os.path.exists('notslip.txt'):
@@ -150,10 +125,10 @@ if unique_ips:
         for line in notslip_result:
             file.write(line + '\n')
     
-    print(f'已保存 {len(result)} 条IP地址和端口信息到ip.txt文件。')
-    print(f'已保存 {len(notslip_result)} 条IP地址和端口信息到notslip.txt文件。')
-    print(f'移动IP: {mobile_ip}')
-    print(f'联通IP: {union_ip}')
-    print(f'电信IP: {telecom_ip}')
+    # print(f'已保存 {len(result)} 条IP地址和端口信息到ip.txt文件。')
+    # print(f'已保存 {len(notslip_result)} 条IP地址和端口信息到notslip.txt文件。')
+    # print(f'总共爬取了 {len(sorted_ips)} 个IP地址')
+    
+    
 else:
     print('未找到有效的IP地址。')
