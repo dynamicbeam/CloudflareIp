@@ -53,17 +53,14 @@ if unique_ips:
     result = []
     
     # 存储IP和运营商的对应关系
-    ip_carrier_map = {}
-    
+    ip_to_carrier_map = {}
     # 重新请求网页获取完整内容，包括运营商信息
     try:
         response = requests.get(urls[0], timeout=5)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            
             # 查找表格行
             rows = soup.find_all('tr')
-            
             # 遍历表格行查找运营商信息
             for row in rows:
                 cells = row.find_all('td')
@@ -71,63 +68,42 @@ if unique_ips:
                     # 第一列通常是运营商名称，第二列是IP地址
                     carrier = cells[0].get_text().strip()
                     ip_cell = cells[1].get_text().strip()
-                    
                     # 从单元格文本中提取IP地址
                     ip_match = re.search(ip_pattern, ip_cell)
                     if ip_match:
                         ip = ip_match.group(0)
-                        # 存储IP和运营商的对应关系
-                        if '移动' in carrier:
-                            ip_carrier_map[ip] = '移动'
-                        elif '联通' in carrier:
-                            ip_carrier_map[ip] = '联通'
-                        elif '电信' in carrier:
-                            ip_carrier_map[ip] = '电信'
-                        else:
-                            ip_carrier_map[ip] = '未知'
-                            
+                        # 直接使用原始carrier字段，若为空则为“未知”
+                        ip_to_carrier_map[ip] = carrier if carrier else '未知'
     except Exception as e:
         print(f'解析运营商信息失败: {e}')
         # 如果解析失败，给所有IP分配未知运营商
         for ip in sorted_ips:
-            ip_carrier_map[ip] = '未知'
-    
+            ip_to_carrier_map[ip] = '未知'
     # 为每个IP地址随机选择一个端口，并添加运营商信息
     for ip in sorted_ips:
-        # 从tsl_ports中随机选择一个端口
         random_port = random.choice(tsl_ports)
-        # 获取运营商信息，如果没有则使用未知
-        carrier = ip_carrier_map.get(ip, '未知')
+        carrier = ip_to_carrier_map.get(ip, '未知')
         result.append(f"{ip}:{random_port}#{carrier}")
-    
     # 写入文件
     with open('ip.txt', 'w', encoding='utf-8') as file:
         for line in result:
             file.write(line + '\n')
-    
     # 创建notslip.txt文件内容
     notslip_result = []
-    
     # 为每个IP地址随机选择一个notsl端口，并添加运营商信息
     for ip in sorted_ips:
-        # 从notsl_ports中随机选择一个端口
         random_port = random.choice(notsl_ports)
-        # 获取运营商信息，如果没有则使用未知
-        carrier = ip_carrier_map.get(ip, '未知')
+        carrier = ip_to_carrier_map.get(ip, '未知')
         notslip_result.append(f"{ip}:{random_port}#{carrier}")
-    
     # 检查notslip.txt文件是否存在，如果存在则删除它
     if os.path.exists('notslip.txt'):
         os.remove('notslip.txt')
-    
     # 写入notslip.txt文件
     with open('notslip.txt', 'w', encoding='utf-8') as file:
         for line in notslip_result:
             file.write(line + '\n')
     
-    # print(f'已保存 {len(result)} 条IP地址和端口信息到ip.txt文件。')
-    # print(f'已保存 {len(notslip_result)} 条IP地址和端口信息到notslip.txt文件。')
-    # print(f'总共爬取了 {len(sorted_ips)} 个IP地址')
+
     
     
 else:
