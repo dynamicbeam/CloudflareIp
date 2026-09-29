@@ -36,16 +36,31 @@ jobs:
         retain_days: 2
         keep_minimum_runs: 6
         
+    - name: Syntax check
+      run: |
+        python -m py_compile ${{ github.workspace }}/collect_ips.py
+        python -m py_compile ${{ github.workspace }}/filter_local.py
+
     - name: Run script
       run: python ${{ github.workspace }}/collect_ips.py
+
+    - name: Test filter script
+      # filter_local.py 平时在本地跑，这里在临时目录空跑一遍验证脚本本身能工作
+      run: |
+        mkdir -p "$RUNNER_TEMP/filter-test"
+        cp "${{ github.workspace }}/candidates.txt" "${{ github.workspace }}/filter_local.py" "$RUNNER_TEMP/filter-test/"
+        cd "$RUNNER_TEMP/filter-test"
+        python filter_local.py
+        echo "--- 生成结果 ---"
+        cat ip.txt
         
     - name: Commit and push changes
       run: |
         git config --local user.email "actions@github.com"
         git config --local user.name "GitHub Action"
-        if [ -n "$(git status --porcelain)" ]; then
-          git add ip.txt
-          git add notslip.txt
+        # 只提交候选文件，ip.txt / notslip.txt 由本地 filter_local.py 实测生成
+        if [ -n "$(git status --porcelain candidates.txt)" ]; then
+          git add candidates.txt
           git commit -m "Automatic update"
           git push
         else
