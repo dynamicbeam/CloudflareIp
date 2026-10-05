@@ -46,7 +46,7 @@ jobs:
       run: python ${{ github.workspace }}/collect_ips.py
 
     - name: Measure and filter from China probes
-      # 借助 Globalping 的中国大陆探针实测落地机房并排除 HKG，全程在 Action 内完成。
+      # 借助 Globalping 的中国移动、中国联通探针同时实测落地机房，任一边命中 HKG 就排除。
       # 失败时不中断：ip.txt / notslip.txt 保持上一版，只提交 candidates.txt。
       continue-on-error: true
       env:

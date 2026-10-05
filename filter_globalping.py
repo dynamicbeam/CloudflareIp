@@ -1,9 +1,10 @@
 """
-中国视角实测过滤脚本：通过 Globalping 的中国大陆探针测量候选 IP 的真实落地机房。
+中国视角实测过滤脚本：通过 Globalping 的中国移动、中国联通探针测量候选 IP 的真实落地机房。
 
-读取 collect_ips.py 抓取的 candidates.txt，用位于中国大陆的探针逐个IP发起 HTTPS 请求，
-读取 Cloudflare /cdn-cgi/trace 返回的真实 colo，排除香港(HKG)等指定机房后，
-生成 ip.txt（TLS端口）和 notslip.txt（非TLS端口）。
+读取 collect_ips.py 抓取的 candidates.txt，把每个候选 IP 交给**一个中国移动探针和一个中国联通探针**
+同时发起 HTTPS 请求，读取 Cloudflare /cdn-cgi/trace 返回的真实 colo。
+只要有一边落在香港(HKG)，或者有一边没测出来，这个 IP 就丢弃；
+两边都确认落在香港以外，才写进 ip.txt（TLS端口）和 notslip.txt（非TLS端口）。
 
 为什么用 Globalping，而不是直接在本脚本里连：
     Cloudflare 是任播(anycast)，同一个 IP 从不同网络接入会落到不同机房。
@@ -12,10 +13,16 @@
     Globalping 在国内有 50+ 个在线探针（移动/联通/电信/阿里/腾讯），
     通过它的 API 就能让"从中国实测"这一步也留在 GitHub Actions 里完成，无需本地操作。
 
+为什么要同时测移动和联通：
+    落地机房是按接入网络分流的，移动和联通经常落在不同机房。实测同一个 IP：
+        104.20.30.105  中国移动(广州)=LAX  中国联通(南宁)=HKG
+    只测一家，另一家的用户就会拿到落在香港的 IP。所以两家都要测，取交集才安全。
+
 实测一致性：
-    所有候选 IP 都交给同一个探针去测（先用一次种子测量锁定探针，再把它的 id
-    作为后续测量的 locations）。否则每个 IP 随机落到不同城市/运营商的探针上，
-    落点不可比，筛选结果没有意义。
+    每家运营商先用一次种子测量找到一台在线探针，把它记成"移动=广州/AS9808"这样的固定坐标，
+    之后所有候选 IP 都只用 country+asn+city+network 去点名这台探针，并且逐条校验测量结果里
+    返回的探针身份和锁定的一致。不一致就说明 Globalping 挑了别的探针，这次结果作废。
+    否则每个 IP 随机落到不同城市/运营商的探针上，落点不可比，筛选结果没有意义。
 
 用法：
     python filter_globalping.py
@@ -43,12 +50,12 @@ CANDIDATES_FILE = 'candidates.txt'
 # 需要排除的机房代码（IATA），香港=HKG，可按需追加
 EXCLUDE_DATACENTERS = {'HKG'}
 
-# 探针选择：按顺序尝试，第一个有在线探针的运营商胜出，然后固定用它测所有IP。
-# 9808 是中国移动骨干，其探针多为 eyeball-network（家宽），最接近家用宽带的落点。
-PROBE_ASNS = [
-    9808, 56046, 56041, 24400, 24445,   # 中国移动
-    4837, 17621, 9929,                   # 中国联通
-    4134,                                # 中国电信
+# 探针分组：每个分组锁定一台固定探针，同一个 IP 由所有分组的探针同时实测。
+# 9808 / 56046 是中国移动骨干，其探针多为 eyeball-network（家宽），最接近家用宽带的落点；
+# 联通同理。某天某家探针全都不在线时该组自动跳过，本次只按还在线的那家过滤。
+PROBE_GROUPS = [
+    {'label': '移动', 'asns': [9808, 56046, 56041, 24400, 24445]},
+    {'label': '联通', 'asns': [4837, 17621, 9929]},
 ]
 PROBE_FALLBACK = {'country': 'CN'}       # 上面都没有就用全部国内探针
 
@@ -59,7 +66,10 @@ MEASURE_PATH = '/cdn-cgi/trace'
 POLL_INTERVAL = 0.6      # 官方要求两次轮询间隔 >= 0.5s，否则触发 2 req/s 限流
 POLL_MAX_TIMES = 40      # 最多轮询次数（约 24 秒）
 HTTP_TIMEOUT = 20
-SEED_MAX_AGE = 150       # 种子测量 id 的保质期（秒），超了就重新锁定探针
+
+# 锁定探针后，用这几个字段去点名同一台探针（API 不接受多个"按测量id复用探针"的地点，
+# 但可以一次传多个 country+asn+city+network 点名，所以移动/联通能在同一次测量里同时实测）
+PROBE_PIN_FIELDS = ('country', 'asn', 'city', 'network')
 
 # TLS端口（写入ip.txt）
 tsl_ports = ["443", "8443", "2053", "2083", "2087", "2096"]
@@ -112,13 +122,22 @@ def wait_measurement(measurement_id):
     return data
 
 
-def lock_probe():
+def probe_key(probe):
+    """探针身份，用于把测量结果对回是哪一台探针（API 返回的探针摘要里没有 id）。"""
+    return (probe.get('asn'), probe.get('city'), probe.get('network'))
+
+
+def describe(probe):
+    return f"{probe.get('city', '?')}/{probe.get('network', '?')}(AS{probe.get('asn', '?')})"
+
+
+def discover_probe(group, used):
     """
-    建一次种子测量锁定单个探针。
-    返回 (种子测量id, 探针信息)。后续所有候选 IP 都用这个 id，确保 vantage 一致。
+    为一个分组锁定一台在线探针：先用一次种子测量找到它，再把它的坐标记下来。
+    返回 {'label','location','asn','city','network'}；没有在线探针时返回 None。
     """
-    attempts = [{'country': 'CN', 'asn': asn} for asn in PROBE_ASNS] + [PROBE_FALLBACK]
-    last_error = None
+    label = group['label']
+    attempts = [{'country': 'CN', 'asn': asn} for asn in group['asns']] + [PROBE_FALLBACK]
     for location in attempts:
         who = f"AS{location['asn']}" if 'asn' in location else '国内任意运营商'
         try:
@@ -130,51 +149,83 @@ def lock_probe():
             })
             data = wait_measurement(seed['id'])
         except RuntimeError as err:
-            print(f'  {who} 建测量失败: {err}')
-            last_error = err
+            print(f'  {label} {who} 建测量失败: {err}')
             continue
 
         results = data.get('results') or []
         if not results:
-            print(f'  {who} 暂时没有在线探针，换下一个运营商')
+            print(f'  {label} {who} 暂时没有在线探针，换下一个运营商')
             continue
 
         probe = results[0].get('probe') or {}
-        print(f'已锁定探针: {probe.get("city", "?")} / {probe.get("network", "?")} (AS{probe.get("asn", "?")})')
-        return seed['id'], probe
+        identity = probe_key(probe)
+        if identity in used:
+            # 回退到"国内任意探针"时可能挑到别组已锁定的机器，重复测没有意义
+            print(f'  {label} {who} 与已锁定的探针相同（{probe.get("network", "?")}），跳过')
+            continue
 
-    raise RuntimeError(f'Globalping 目前没有可用的中国大陆探针: {last_error}')
+        pin = {field: probe.get(field) for field in PROBE_PIN_FIELDS}
+        found = {'label': label, 'location': pin}
+        found.update(probe)
+        print(f'  {label} 已锁定探针: {describe(probe)}')
+        return found
+
+    return None
 
 
-def measure_colo(probe_id, ip):
-    """让锁定的探针去连候选IP，读取 /cdn-cgi/trace 里的真实 colo，失败返回 None。"""
+def lock_probes():
+    """每个分组各锁定一台探针，返回按分组顺序排列的探针列表。"""
+    locked = []
+    used = set()
+    for group in PROBE_GROUPS:
+        probe = discover_probe(group, used)
+        if probe is None:
+            print(f'  {group["label"]} 暂时没有在线探针，本次不参与过滤')
+            continue
+        used.add(probe_key(probe))
+        locked.append(probe)
+
+    if not locked:
+        raise RuntimeError('Globalping 目前没有可用的中国大陆探针')
+    if len(locked) < len(PROBE_GROUPS):
+        print('注意：本次只拿到部分运营商的探针，筛选结果仅对这些运营商有效。')
+    return locked
+
+
+def measure_colos(probes, ip):
+    """
+    同一次测量里让所有锁定的探针各测一次该 IP。
+    返回 {分组label: colo}；没测出机房、或回来的探针不是锁定的那台，都不会出现在结果里，
+    由调用方重新锁定探针后重试。
+    """
     payload = {
         'type': 'http',
         'target': ip,
-        'locations': probe_id,
+        'locations': [probe['location'] for probe in probes],
         'measurementOptions': {
             'protocol': 'HTTPS',
             'port': 443,
             'request': {'host': MEASURE_HOST, 'path': MEASURE_PATH, 'method': 'GET'},
         },
     }
-    try:
-        created = create_measurement(payload)
-    except RuntimeError as err:
-        # 种子测量 id 失效时 API 返回 422，交给外层重新锁定探针后重试
-        if 'HTTP 422' in str(err):
-            raise
-        print(f'  {ip} 创建测量失败: {err}')
-        return None
-
+    created = create_measurement(payload)
     data = wait_measurement(created['id'])
-    result = ((data.get('results') or [{}])[0]).get('result') or {}
-    if result.get('status') != 'finished':
-        return None
+    if data.get('status') != 'finished':
+        return {}
 
-    body = result.get('rawBody') or result.get('rawOutput') or ''
-    found = re.search(r'^colo=(\S+)', body, re.M)
-    return found.group(1) if found else None
+    label_by_probe = {probe_key(probe): probe['label'] for probe in probes}
+    colos = {}
+    for item in data.get('results') or []:
+        # 探针身份对不上，说明这次挑了别的探针，结果不可比，丢掉
+        label = label_by_probe.get(probe_key(item.get('probe') or {}))
+        result = item.get('result') or {}
+        if not label or result.get('status') != 'finished':
+            continue
+        body = result.get('rawBody') or result.get('rawOutput') or ''
+        colo = re.search(r'^colo=(\S+)', body, re.M)
+        if colo:
+            colos[label] = colo.group(1)
+    return colos
 
 
 # ---------------------------------------------------------------- 读取候选
@@ -201,72 +252,88 @@ if not ips:
 
 # ------------------------------------------------------- 从中国探针逐个实测
 
-print(f'准备从中国大陆探针实测 {len(ips)} 个IP的落地机房...')
+want_labels = '+'.join(group['label'] for group in PROBE_GROUPS)
+print(f'准备从中国大陆探针实测 {len(ips)} 个IP的落地机房（{want_labels} 同时实测，取交集）...')
 try:
-    probe_id, probe_info = lock_probe()
+    probes = lock_probes()
 except RuntimeError as err:
     print(f'锁定探针失败: {err}')
     print('未生成 ip.txt / notslip.txt（已有文件保持不变）。')
     raise SystemExit(1)
 
-probe_name = f"{probe_info.get('city', '?')}/{probe_info.get('network', '?')}"
-print(f'开始实测...')
-
-colo_map = {}
-failed_ips = []
-seed_time = time.time()
-
-
-def measure_with_reseed(ip):
-    """实测单个IP；探针 id 过期（422）时自动重新锁定并重试一次。"""
-    global probe_id, probe_info, probe_name, seed_time
+def reseed():
+    """重新锁定所有探针；锁定不了就直接退出，避免写出错误的文件。"""
+    global probes
+    before = [probe['label'] for probe in probes]
     try:
-        return measure_colo(probe_id, ip)
+        probes = lock_probes()
     except RuntimeError as err:
-        if 'HTTP 422' not in str(err):
-            print(f'  {ip} 创建测量失败: {err}')
-            return None
-        print(f'  {ip} 探针已过期，重新锁定后重试...')
+        print(f'重新锁定探针失败: {err}')
+        print('未生成文件（已有文件保持不变）。')
+        raise SystemExit(1)
+    if [probe['label'] for probe in probes] != before:
+        print(f'注意：参与过滤的运营商变成了 {"、".join(probe["label"] for probe in probes)}，'
+              '本次结果的 #后缀以最后一次锁定的探针顺序为准。')
+
+
+def measure_from_china(ip):
+    """
+    实测单个IP，返回与 probes 同顺序的机房列表。
+    所有探针都测出机房才返回，缺一边就返回 None（拿不准的一律不放行）。
+    有探针掉线或挑错探针时，重新锁定后重试一次。
+    """
+    for attempt in range(2):
         try:
-            probe_id, probe_info = lock_probe()
-        except RuntimeError as lock_err:
-            print(f'  重新锁定探针失败: {lock_err}')
-            raise SystemExit('探针不可用，未生成文件（已有文件保持不变）。')
-        probe_name = f"{probe_info.get('city', '?')}/{probe_info.get('network', '?')}"
-        seed_time = time.time()
-        return measure_colo(probe_id, ip)
-
-
-for index, ip in enumerate(ips, 1):
-    colo = measure_with_reseed(ip)
-    if not colo:
-        failed_ips.append(ip)
-        print(f'  [{index}/{len(ips)}] {ip:<16} 实测失败')
-    else:
-        colo_map[ip] = colo
-        mark = '  <-- 已排除' if colo.upper() in EXCLUDE_DATACENTERS else ''
-        print(f'  [{index}/{len(ips)}] {ip:<16} colo={colo}{mark}')
-
-    # 种子测量 id 会过期，快到保质期就提前换一个新的，避免后面的 IP 批量失败
-    if time.time() - seed_time > SEED_MAX_AGE and index < len(ips):
-        print('  探针即将过期，提前重新锁定...')
-        try:
-            probe_id, probe_info = lock_probe()
-            probe_name = f"{probe_info.get('city', '?')}/{probe_info.get('network', '?')}"
-            seed_time = time.time()
+            colos = measure_colos(probes, ip)
         except RuntimeError as err:
-            print(f'  重新锁定探针失败: {err}')
+            # 建不出测量一般是限流或 API 挂了，继续跑只会把剩下的 IP 一路错杀，直接退出
+            print(f'  {ip} 无法创建测量: {err}')
             print('未生成文件（已有文件保持不变）。')
             raise SystemExit(1)
 
-kept = [ip for ip in ips if colo_map.get(ip) and colo_map[ip].upper() not in EXCLUDE_DATACENTERS]
-excluded = [ip for ip in ips if colo_map.get(ip) and colo_map[ip].upper() in EXCLUDE_DATACENTERS]
+        if len(colos) == len(probes):
+            return [colos[probe['label']] for probe in probes]
 
-print(f'实测成功 {len(kept) + len(excluded)}/{len(ips)} 个（探针：{probe_name}）')
-if excluded:
-    print(f'中国视角实测落在 {"/".join(sorted(EXCLUDE_DATACENTERS))} 已排除 {len(excluded)} 个: {", ".join(excluded)}')
+        if attempt == 0:
+            print(f'  {ip} 只有 {len(colos)}/{len(probes)} 台探针返回结果，重新锁定后重试...')
+            reseed()
+            continue
+        return None
+
+    return None
+
+
+kept = []
+colo_map = {}          # ip -> [移动的colo, 联通的colo]
+hkg_ips = []
+failed_ips = []
+
+for index, ip in enumerate(ips, 1):
+    colos = measure_from_china(ip)
+
+    if colos is None:
+        failed_ips.append(ip)
+        print(f'  [{index}/{len(ips)}] {ip:<16} 实测失败')
+    else:
+        detail = '  '.join(f'{probe["label"]}={colo}' for probe, colo in zip(probes, colos))
+        if any(colo.upper() in EXCLUDE_DATACENTERS for colo in colos):
+            hkg_ips.append(ip)
+            mark = '  <-- 已排除'
+        else:
+            kept.append(ip)
+            colo_map[ip] = colos
+            mark = ''
+        print(f'  [{index}/{len(ips)}] {ip:<16} {detail}{mark}')
+
+labels = list(dict.fromkeys(probe['label'] for probe in probes))
+probe_desc = '、'.join(probe['label'] + '=' + describe(probe) for probe in probes)
+label_suffix = ','.join(probe['label'] for probe in probes)
+exclude_name = '/'.join(sorted(EXCLUDE_DATACENTERS))
+print(f'实测成功 {len(kept) + len(hkg_ips)}/{len(ips)} 个（探针：{probe_desc}）')
+if hkg_ips:
+    print(f'{" 或 ".join(labels)}实测落在 {exclude_name} 已排除 {len(hkg_ips)} 个: {", ".join(hkg_ips)}')
 if failed_ips:
-    # 连不上或读不到机房的，一并剔除，避免漏掉香港
+    # 有一边没测出来（连不上或读不到机房）的，一并剔除，避免漏掉香港
     print(f'实测失败已排除 {len(failed_ips)} 个: {", ".join(failed_ips)}')
 
 if not kept:
@@ -278,10 +345,11 @@ if not kept:
 
 with open('ip.txt', 'w', encoding='utf-8') as file:
     for ip in kept:
-        file.write(f"{ip}:{random.choice(tsl_ports)}#{colo_map[ip]}\n")
+        file.write(f"{ip}:{random.choice(tsl_ports)}#{','.join(colo_map[ip])}\n")
 
 with open('notslip.txt', 'w', encoding='utf-8') as file:
     for ip in kept:
-        file.write(f"{ip}:{random.choice(notsl_ports)}#{colo_map[ip]}\n")
+        file.write(f"{ip}:{random.choice(notsl_ports)}#{','.join(colo_map[ip])}\n")
 
-print(f'已生成 ip.txt / notslip.txt，共 {len(kept)} 个非香港IP（#后面是中国探针实测的落地机房）')
+print(f'已生成 ip.txt / notslip.txt，共 {len(kept)} 个IP'
+      f'（{" 和 ".join(labels)}都确认非{exclude_name}，#后面按 {label_suffix} 顺序列出实测机房）')
